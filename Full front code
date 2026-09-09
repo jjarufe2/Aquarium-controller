@@ -1,0 +1,3053 @@
+#include <Arduino.h>
+#include <WebSocketsClient.h>
+#include <WiFiMulti.h>
+#include <WiFiUdp.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
+TFT_eSPI tft = TFT_eSPI();
+DeviceAddress sensorAddress;
+
+
+#define WIFI_SSID "ATTMjuFeA6"
+#define WIFI_PASSWORD "r8c9f4jcktp="
+
+#define WS_HOST "9wzlx4scul.execute-api.us-east-1.amazonaws.com"
+#define WS_PORT 443
+#define WS_URL "/dev"
+#define LOAD_GFXFF
+#define JSON_DOC_SIZE 2048
+#define MSG_SIZE 256
+#define TEMP_PIN 33
+//#define tempPinSalt 27
+#define BACKGROUND_COLOR TFT_BLACK
+#define HEADER_COLOR 0x1082
+#define FOOTER_COLOR 0x1082
+#define CARD_COLOR 0x18E3
+#define BORDER_COLOR 0x4208
+#define TEXT_COLOR TFT_WHITE
+#define MUTED_COLOR TFT_LIGHTGREY
+#define ACCENT_COLOR TFT_CYAN
+#define ON_COLOR TFT_GREEN
+#define OFF_COLOR TFT_RED
+#define floatSwitchFresh 14
+#define floatSwitchSalt 12
+const uint16_t PACKET_HEADER = 0xABCD;
+const uint16_t PACKET_FOOTER = 0xEF12;
+const int headerHeight = 40;
+const int footerHeight = 40;
+const int sideMargin = 8;
+uint16_t calibrationData[5] = { 472, 3289, 407, 3277, 7 };
+int temporaryStatusArr[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+const int sensorCount = 8;
+const int functionCount = 8;
+const int functionPages = 6;
+const int waterChangeFunctions = 5;
+
+int screenWidth;
+int screenHeight;
+const int rowHeight = 42;
+const int rowGap = 5;
+const int flowPinIn = 27;
+const int flowPinOut = 26;
+
+int scrollOffset = 0;
+int maximumScroll = 0;
+bool emergencyStop = false;
+bool devicePageTouch = false;
+float gallonsIn = 0.0f;
+float gallonsOut = 0.0f;
+unsigned long flowIntervalFill = 0;
+unsigned long flowIntervalDrain = 0;
+volatile unsigned long pulseCount1 = 0;
+volatile unsigned long pulseCount2 = 0;
+volatile unsigned long lastFlowPulseIn = 0;
+volatile unsigned long lastFlowPulseOut = 0;
+const unsigned long MIN_FLOW_PULSE_US = 1000;  // Ignore pulses , need to edit after
+uint32_t fillPulses;
+uint32_t drainPulses;
+const char* sensorNames[sensorCount] = {
+  "Tank Temperature",
+  "Salt reservoir temp",
+  "pH Level",
+  "Salt reservoir level",
+  "Fresh reservoir level",
+  "TDS", "Fresh reservoir temp", "adc value"
+};
+
+const char* sensorValues[sensorCount] = {
+  "77.0 F",
+  "75.8 F",
+  "7.45",
+  "35.0 ppt",
+  "85 %",
+  "2.4 L/min",
+};
+OneWire oneWire(TEMP_PIN);
+DallasTemperature sensors(&oneWire);
+uint16_t x, y;
+
+uint16_t calData[5] = { 472, 3289, 407, 3277, 7 };
+
+
+
+
+
+bool screenSleeping = false;
+
+int machineStatusArr[8];
+
+bool isPerforming = false;
+bool onMenu = false;
+bool inDrain = false;
+bool inFill = false;
+bool reservoirFillingInProgress = false;
+bool inTransfer = false;
+bool countFillFlow = false;
+bool countDrainFlow = false;
+bool automaticWaterChangeCounting = false;
+
+
+const int phMeter1 = 32;
+const int tdsMeter = 35;
+const int BACKLIGHT_PIN = 21;
+
+const unsigned long SENSOR_SEND_INTERVAL = 5000;
+unsigned long lastTouchTime = 0;
+const unsigned long screenTimeout = 100000;
+unsigned long startTime;
+unsigned long dataInterval = 0;
+unsigned long displayInterval = 0;
+unsigned long previousSensorSend = 0;
+unsigned long headerDrawInterval = 0;
+unsigned long phReadingInterval = 0;
+unsigned long tdsReadingInterval = 0;
+unsigned long graphDataInterval = 0;
+int phReadings = 0;
+int phSum = 0;
+int tdsReadings = 0;
+int tdsSum = 0;
+int dataIndex = 0;
+float tankTempData[12];
+float saltReservoirTempData[12];
+float phData[12];
+float tdsData[12];
+float freshReservoirData[12];
+int readingsArr[50];
+int tdsReadingsArr[50];
+float ph;
+int commandCount;
+//typdef Struct {
+//float tankTemp
+//}parameters;
+
+
+struct dataPacket {
+  // indexes: 0)tankTemp, 1)reservoir temp 2)tankph,3)salt reservoir level,4)fresh Reservoir level,5) tds,6)freshwatertemp
+  float parameters[sensorCount] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+  const char* functionNames[functionCount] = { "Heater", "Mixers", "Main pump", "Drain pump", "drain solenoid", "Fill pump", "fill solenoid", "Transfer pump" };
+  int statusArr[functionCount] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+  const char* graphNames[5] = { "Tank temp", "Reservoir temp", "Tank Ph", "Tank tds", "fresh reservoir temp" };
+  const char* WaterChangeFunctionNames[waterChangeFunctions] = { "Start water change", "Fill", "Drain", "Transfer", "Reservoir fill" };
+  int waterChangeStatusArr[waterChangeFunctions] = { 0, 0, 0, 0 };
+  float fillGallons;
+  float drainGallons;
+  int floatStatusFresh;
+  int floatStatusSalt;
+  /*float tankTemp;
+  float reservoirTemp;
+  float tankPh;
+  int command=0;
+  */
+  int changeStatus = 0;
+};
+struct dataPacket systemInfo;
+struct dataSent {
+  uint16_t header;
+  float tankTemp;
+  float tankPh;
+  float tds;
+  float freshReservoirTemp;
+  float saltReservoirTemp;
+  float fillGallons;
+  float drainGallons;
+  int floatStatusFresh;
+  int floatStatusSalt;
+  int command[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+  uint16_t footer = 0XEF12;
+};
+struct dataSent sentData;
+struct dataRecieved {
+  uint16_t header;
+  int changeStatus = 0;
+  int waterChangeStatusArr[waterChangeFunctions] = { 0, 0, 0, 0, 0 };
+  int statusArr[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+  uint16_t footer = 0XEF12;
+};
+struct dataRecieved receivedData;
+
+
+
+
+enum Page {
+  homePage,
+  sensorsPage,
+  devicePage,
+  graphPage,
+  mainFunctionPage,
+  waterChangePage,
+  mainGraphPage,
+  waterChangePopUp,
+  fillPopUp,
+  drainPopUp,
+  transferPopUp,
+  reservoirFillpopUp
+
+
+};
+
+Page currentPage = homePage;
+
+WiFiMulti wifiMulti;
+WebSocketsClient wsClient;
+WiFiUDP espLinkUDP;
+
+
+const uint16_t FRONT_RX_PORT = 4210;
+const uint16_t BACK_RX_PORT  = 4211;
+IPAddress getEspLinkBroadcastAddress() {
+  IPAddress ip = WiFi.localIP();
+  IPAddress mask = WiFi.subnetMask();
+
+  return IPAddress(
+    ip[0] | (uint8_t)(~mask[0]),
+    ip[1] | (uint8_t)(~mask[1]),
+    ip[2] | (uint8_t)(~mask[2]),
+    ip[3] | (uint8_t)(~mask[3])
+  );
+}
+void IRAM_ATTR flowMeterIn() {
+  unsigned long now = micros();
+
+  if (now - lastFlowPulseIn >= MIN_FLOW_PULSE_US) {
+    pulseCount1++;
+    lastFlowPulseIn = now;
+  }
+}
+
+void IRAM_ATTR flowMeterOut() {
+  unsigned long now = micros();
+
+  if (now - lastFlowPulseOut >= MIN_FLOW_PULSE_US) {
+    pulseCount2++;
+    lastFlowPulseOut = now;
+  }
+}
+
+void resetFillFlowCounter() {
+  noInterrupts();
+  pulseCount1 = 0;
+  lastFlowPulseIn = 0;
+  interrupts();
+
+  fillPulses = 0;
+  gallonsIn = 0.0f;
+  systemInfo.fillGallons = 0.0f;
+  flowIntervalFill = millis();
+}
+
+void resetDrainFlowCounter() {
+  noInterrupts();
+  pulseCount2 = 0;
+  lastFlowPulseOut = 0;
+  interrupts();
+
+  drainPulses = 0;
+  gallonsOut = 0.0f;
+  systemInfo.drainGallons = 0.0f;
+  flowIntervalDrain = millis();
+}
+void sendErrorMessage(const char* error) {
+  char msg[MSG_SIZE];
+
+  sprintf(msg, "{\"action\":\"msg\",\"type\":\"error\",\"body\":\"%s\"}", sendErrorMessage);
+
+  wsClient.sendTXT(msg);
+}
+
+void sendOkMessage() {
+  wsClient.sendTXT("{\"action\":\"msg\",\"type\":\"status\",\"body\":\"ok\"}");
+}
+
+uint8_t toMode(const char* val) {
+  if (strcmp(val, "output") == 0) {
+    return OUTPUT;
+  }
+
+  if (strcmp(val, "input_pullup") == 0) {
+    return INPUT_PULLUP;
+  }
+
+  return INPUT;
+}
+
+
+
+const char* sendPowerStatus(const char* device) {
+  if (strcmp("heater", device) == 0) {
+    if (receivedData.statusArr[0] == 1) {
+      return "on";
+    } else {
+      return "off";
+    }
+  } else if (strcmp("mixers", device) == 0) {
+    if (receivedData.statusArr[1] == 1) {
+      return "on";
+    } else {
+      return "off";
+    }
+
+  } else if (strcmp("mainpump", device) == 0) {
+    if (receivedData.statusArr[2] == 1) {
+      return "on";
+    } else {
+      return "off";
+    }
+
+  } else if (strcmp("drainpump", device) == 0) {
+    if (receivedData.statusArr[3] == 1) {
+      return "on";
+    } else {
+      return "off";
+    }
+
+  } else if (strcmp("drainsolenoid", device) == 0) {
+    if (receivedData.statusArr[4] == 1) {
+      return "on";
+    } else {
+      return "off";
+    }
+
+  } else if (strcmp("fillpump", device) == 0) {
+    if (receivedData.statusArr[5] == 1) {
+      return "on";
+    } else {
+      return "off";
+    }
+
+  } else if (strcmp("fillsolenoid", device) == 0) {
+    if (receivedData.statusArr[6] == 1) {
+      return "on";
+    } else {
+      return "off";
+    }
+
+  } else if (strcmp("transferpump", device) == 0) {
+    if (receivedData.statusArr[7] == 1) {
+      return "on";
+    } else {
+      return "off";
+    }
+  }
+}
+void sendSensorData() {
+
+  if (!wsClient.isConnected()) {
+    Serial.println(
+      "Cannot send sensor data: WebSocket disconnected");
+    return;
+  }
+
+  StaticJsonDocument<512> doc;
+
+  doc["action"] = "sensorData";
+  doc["target"] = "aquarium-dashboard";
+
+  JsonObject data = doc.createNestedObject("data");
+
+  // Current sensor values
+  data["temperature"] = sentData.tankTemp;
+  data["tankph"] = sentData.tankPh;
+  data["reservoirtemp"] = systemInfo.parameters[1];
+  data["heater"] = sendPowerStatus("heater");
+  data["mixers"] = sendPowerStatus("mixers");
+  data["mainpump"] = sendPowerStatus("mainpump");
+  data["drainpump"] = sendPowerStatus("drainpump");
+  data["drainsolenoid"] = sendPowerStatus("drainsolenoid");
+  data["fillpump"] = sendPowerStatus("fillpump");
+  data["fillsolenoid"] = sendPowerStatus("fillsolenoid");
+  data["transferpump"] = sendPowerStatus("transferpump");
+  data["tds"]=systemInfo.parameters[5];
+  data["freshtemp"]=systemInfo.parameters[6];
+  data["freshfloat"]=systemInfo.parameters[4]==1? "Normal":"Low";
+  data["saltfloat"]=systemInfo.parameters[3]==1? "Normal":"Low";
+  /*data["flowRateGpm"] = sentData.tankTemp;
+  data["totalGallons"] = sentData.tankTemp;
+  */
+
+
+
+  String jsonMessage;
+
+  serializeJson(doc, jsonMessage);
+
+  wsClient.sendTXT(jsonMessage);
+
+  Serial.print("Sensor data sent: ");
+  Serial.println(jsonMessage);
+}
+
+
+void checkScreenTimer() {
+  if (!screenSleeping && millis() - lastTouchTime >= screenTimeout) {
+
+    //sleepScreen();
+  }
+}
+void timer() {
+  startTime = millis();
+}
+float fillPhArray() {
+  // int raw = analogRead(phMeter1);
+  //return raw;
+  int milliVolts = analogReadMilliVolts(phMeter1);
+  return milliVolts;
+}
+float fillTdsArray() {
+  // int raw = analogRead(phMeter1);
+  //return raw;
+  int milliVolts = analogReadMilliVolts(tdsMeter);
+  return milliVolts;
+}
+float getFreshWaterTemp() {
+  //return systemInfo.parameters[6];
+}
+float readTds() {
+  if (millis() - tdsReadingInterval > 40) {
+    tdsReadingInterval = millis();
+    //int raw = fillPhArray();
+    int millivolts = fillTdsArray();
+    //Serial.print("tds adc");
+   // Serial.print(millivolts);
+   // Serial.print("\n");
+    //phSum += raw;
+    tdsSum += millivolts;
+    //readingsArr[phReadings]=raw;
+    tdsReadingsArr[tdsReadings] = millivolts;
+    tdsReadings++;
+  }
+
+
+  if (tdsReadings >= 40) {
+    int minValue = tdsReadingsArr[0];
+    int maxValue = tdsReadingsArr[0];
+    for (int x = 0; x < 40; x++) {
+
+      maxValue = maxValue > tdsReadingsArr[x] ? maxValue : tdsReadingsArr[x];
+      minValue = minValue < tdsReadingsArr[x] ? minValue : tdsReadingsArr[x];
+    }
+    tdsSum -= (maxValue + minValue);
+    float average = tdsSum / 38.0;
+    //float voltage =average*(3.3/4095.0);
+    float voltage = average / 1000.0;
+    float tempF = systemInfo.parameters[6];
+    if (!isfinite(tempF) || tempF < 40.0 || tempF > 100.0) {
+      tempF = 77.0;
+    }
+    float tempC = (tempF - 32.0) * 5.0 / 9.0;
+
+    float compensationCoefficient = 1.0 + 0.02 * (tempC - 25.0);
+    //float compensationCoefficient=1.0+0.02*(systemInfo.parameters[6]-25.0);
+    float compensatedVoltage = voltage / compensationCoefficient;
+    float tds = (133.42 * pow(compensatedVoltage, 3) - 255.86 * pow(compensatedVoltage, 2) + 857.39 * compensatedVoltage) * 0.5;
+    tdsReadings = 0;
+    tdsSum = 0;
+    for (int reset = 0; reset < 40; reset++) {
+      tdsReadingsArr[reset] = 0;
+    }
+    //Serial.print("Ph is: ");
+    //Serial.print(ph);
+    //systemInfo.parameters[6]=getFreshWaterTemp();
+    return tds;
+  }
+  return 0;
+}
+
+float readPh() {
+
+
+
+
+
+
+  if (millis() - phReadingInterval > 40) {
+    phReadingInterval = millis();
+    //int raw = fillPhArray();
+    int millivolts = fillPhArray();
+    systemInfo.parameters[7] = millivolts;
+   // Serial.print("pH voltage: ");
+    //Serial.print(millivolts);
+    //Serial.println(" mV");
+    //phSum += raw;
+    phSum += millivolts;
+    //readingsArr[phReadings]=raw;
+    readingsArr[phReadings] = millivolts;
+    phReadings++;
+  }
+
+
+  if (phReadings >= 40) {
+    int minValue = readingsArr[0];
+    int maxValue = readingsArr[0];
+    for (int x = 0; x < 40; x++) {
+
+      maxValue = maxValue > readingsArr[x] ? maxValue : readingsArr[x];
+      minValue = minValue < readingsArr[x] ? minValue : readingsArr[x];
+    }
+    phSum -= (maxValue + minValue);
+    float average = phSum / 38.0;
+    //float voltage =average*(3.3/4095.0);
+    float voltage = average / 1000.0;
+
+
+    float ph = 4.0 + (average - 1066.0) * (3.0 / 398.0);
+
+    phReadings = 0;
+    phSum = 0;
+    for (int reset = 0; reset < 40; reset++) {
+      readingsArr[reset] = 0;
+    }
+    //Serial.print("Ph is: ");
+    //Serial.print(ph);
+
+    return ph;
+  }
+  return 0;
+}
+void getTemp() {
+  sensors.requestTemperatures();
+  DeviceAddress tempProbe1 = { 0x28, 0x16, 0x4B, 0x22, 0x00, 0x00, 0x00, 0x19 };
+  DeviceAddress tempProbe2 = { 0x28, 0x81, 0x7C, 0x22, 0x00, 0x00, 0x00, 0xF8 };
+  DeviceAddress tempProbe3 = { 0x28, 0x4F, 0x12, 0x26, 0x00, 0x00, 0x00, 0xC9 };
+  float tankTemp=sensors.getTempF(tempProbe1);
+  float saltTemp=sensors.getTempF(tempProbe2);
+  float freshTemp=sensors.getTempF(tempProbe3);
+  
+  if(tankTemp>0){
+  systemInfo.parameters[0] = tankTemp;
+  }
+  if(saltTemp>0){
+    systemInfo.parameters[1] =saltTemp;
+  }
+  
+  if(freshTemp>0){
+  systemInfo.parameters[6] = freshTemp;
+  }
+
+
+
+
+
+
+
+  
+}
+
+
+//}
+void getParameters() {
+  //systemInfo.parameters[]=getTdsValue();
+
+  //systemInfo.parameters[0]=getTemp();
+  getTemp();
+}
+
+void getFloatData() {
+  systemInfo.floatStatusFresh = digitalRead(floatSwitchFresh) == HIGH ? 0 : 1;
+  systemInfo.floatStatusSalt = digitalRead(floatSwitchSalt) == HIGH ? 0 : 1;
+  systemInfo.parameters[3] = digitalRead(floatSwitchSalt) == HIGH ? 0 : 1;
+  systemInfo.parameters[4] = digitalRead(floatSwitchFresh) == HIGH ? 0 : 1;
+  /* Serial.print("saltlevel=");
+  Serial.print(systemInfo.floatStatusSalt);
+  Serial.print("\n");
+  Serial.print("freshlevel=");
+  Serial.print(systemInfo.floatStatusFresh);
+  Serial.print("\n");
+*/
+}
+void sendData() {
+  getFloatData();
+  sentData.floatStatusFresh = systemInfo.floatStatusFresh;
+  sentData.floatStatusSalt = systemInfo.floatStatusSalt;
+  sentData.saltReservoirTemp = systemInfo.parameters[1];
+  sentData.freshReservoirTemp = systemInfo.parameters[6];
+  sentData.tankPh = systemInfo.parameters[2];
+  sentData.fillGallons = systemInfo.fillGallons;
+  sentData.drainGallons = systemInfo.drainGallons;
+  sentData.tankTemp = systemInfo.parameters[0];
+  sentData.tds = systemInfo.parameters[5];
+  sentData.freshReservoirTemp = systemInfo.parameters[6];
+  sentData.header = 0xABCD;
+  sentData.footer = 0XEF12;
+ 
+  if (WiFi.status() == WL_CONNECTED) {
+    espLinkUDP.beginPacket(getEspLinkBroadcastAddress(), BACK_RX_PORT);
+    espLinkUDP.write(reinterpret_cast<const uint8_t*>(&sentData), sizeof(sentData));
+    espLinkUDP.endPacket();
+  }
+  //Serial.print( "command sent: ");
+  //Serial.print("{");
+  commandCount = 0;
+  for (int x = 0; x < 8; x++) {
+    Serial.print(sentData.command[x]);
+    //Serial.print("/");
+
+    sentData.command[x] = 0;
+  }
+  //Serial.print("}\n");
+}
+void checkPower(int position, int y) {
+  if (onMenu == true) {
+    tft.fillRect(250, y, 70, 30, TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(270, y);
+    if (systemInfo.statusArr[position] == 1) {
+
+      tft.print("on");
+
+    } else {
+      tft.print("off");
+    }
+  }
+}
+void displayStatus() {
+  
+  int receivedStatus = systemInfo.changeStatus;
+  bool wasInFill = inFill;
+  bool wasInDrain = inDrain;
+
+  switch (receivedStatus) {
+    case 2:  // draining
+      if (!wasInDrain && !countDrainFlow) {
+        resetDrainFlowCounter();
+      }
+      inDrain = true;
+      inFill = false;
+      reservoirFillingInProgress = false;
+      inTransfer = false;
+      countDrainFlow = true;
+      countFillFlow = false;
+      break;
+
+    case 3:  // filling
+      
+      if (!wasInFill && !countFillFlow) {
+        resetFillFlowCounter();
+      }
+      inDrain = false;
+      inFill = true;
+      reservoirFillingInProgress = false;
+      inTransfer = false;
+      countDrainFlow = false;
+      countFillFlow = true;
+      break;
+
+    case 4:  // reservoir fill
+      inDrain = false;
+      inFill = false;
+      reservoirFillingInProgress = true;
+      inTransfer = false;
+      countDrainFlow = false;
+      countFillFlow = false;
+      break;
+
+    case 5:  // transfer
+      inDrain = false;
+      inFill = false;
+      reservoirFillingInProgress = false;
+      inTransfer = true;
+      countDrainFlow = false;
+      countFillFlow = false;
+      break;
+
+    case 6:  // stage/operation finished or stopped
+      {
+       
+        bool automaticStageTransition =
+          automaticWaterChangeCounting && systemInfo.waterChangeStatusArr[0] == 1;
+
+        if (!automaticStageTransition) {
+          if (automaticWaterChangeCounting) {
+            // Entire automatic water change is finished/stopped.
+            resetDrainFlowCounter();
+            resetFillFlowCounter();
+          } else {
+           
+            if (wasInDrain) {
+              resetDrainFlowCounter();
+            }
+            if (wasInFill) {
+              resetFillFlowCounter();
+            }
+          }
+        }
+
+        inDrain = false;
+        inFill = false;
+        reservoirFillingInProgress = false;
+        inTransfer = false;
+        countDrainFlow = false;
+        countFillFlow = false;
+
+        if (!automaticStageTransition) {
+          automaticWaterChangeCounting = false;
+          systemInfo.changeStatus = 0;
+        }
+        break;
+      }
+
+    case 0: 
+      inDrain = false;
+      inFill = false;
+      reservoirFillingInProgress = false;
+      inTransfer = false;
+      countDrainFlow = false;
+      countFillFlow = false;
+      automaticWaterChangeCounting = false;
+      break;
+
+    default:
+      return;
+  }
+
+ 
+  drawHeaderWithPage();
+}
+
+void sendCommandArray(int command) {
+
+  
+  if (commandCount >= 8) {
+    return;
+  }
+
+  switch (command) {
+
+    case 0:
+      sentData.command[commandCount] = 25;
+      break;
+
+    case 1:
+      sentData.command[commandCount] = 33;
+      break;
+
+    case 2:
+      sentData.command[commandCount] = 14;
+      break;
+
+    case 3:
+      sentData.command[commandCount] = 13;
+      break;
+
+    case 4:
+      sentData.command[commandCount] = 27;
+      break;
+
+    case 5:
+      sentData.command[commandCount] = 12;
+      break;
+
+    case 6:
+      sentData.command[commandCount] = 26;
+      break;
+
+    case 7:
+      //sentData.command[commandCount] = 32;
+      break;
+    case 25:
+      sentData.command[commandCount] = 25;
+      break;
+    case 33:
+      sentData.command[commandCount] = 33;
+      break;
+    case 14:
+      sentData.command[commandCount] = 14;
+      break;
+    case 13:
+      sentData.command[commandCount] = 13;
+      break;
+    case 27:
+      sentData.command[commandCount] = 27;
+      break;
+    case 12:
+      sentData.command[commandCount] = 12;
+      break;
+    case 26:
+      sentData.command[commandCount] = 26;
+      break;
+    case 100:
+      resetFillFlowCounter();
+      resetDrainFlowCounter();
+      automaticWaterChangeCounting = true;
+      countDrainFlow = true;
+      countFillFlow = false;
+      sentData.command[commandCount] = 100;
+      break;
+
+    case 121:
+      resetFillFlowCounter();
+      automaticWaterChangeCounting = false;
+      countFillFlow = true;
+      countDrainFlow = false;
+      sentData.command[commandCount] = 121;
+      break;
+
+    case 122:
+      resetFillFlowCounter();
+      automaticWaterChangeCounting = false;
+      countFillFlow = true;
+      countDrainFlow = false;
+      sentData.command[commandCount] = 122;
+      break;
+
+    case 123:
+      resetFillFlowCounter();
+      automaticWaterChangeCounting = false;
+      countFillFlow = true;
+      countDrainFlow = false;
+      sentData.command[commandCount] = 123;
+      break;
+
+    case 131:
+      resetDrainFlowCounter();
+      automaticWaterChangeCounting = false;
+      countDrainFlow = true;
+      countFillFlow = false;
+      sentData.command[commandCount] = 131;
+      break;
+
+    case 132:
+      resetDrainFlowCounter();
+      automaticWaterChangeCounting = false;
+      countDrainFlow = true;
+      countFillFlow = false;
+      sentData.command[commandCount] = 132;
+      break;
+
+    case 133:
+      resetDrainFlowCounter();
+      automaticWaterChangeCounting = false;
+      countDrainFlow = true;
+      countFillFlow = false;
+      sentData.command[commandCount] = 133;
+      break;
+
+    case 141:
+      sentData.command[commandCount] = 141;
+      break;
+
+    case 151:
+      sentData.command[commandCount] = 151;
+      break;
+
+    case 200:
+      sentData.command[commandCount] = 200;
+      break;
+
+    case 201:
+      sentData.command[commandCount] = 201;
+      break;
+
+    case 202:
+      sentData.command[commandCount] = 202;
+      break;
+
+    case 203:
+      sentData.command[commandCount] = 203;
+      break;
+
+    case 204:
+      sentData.command[commandCount] = 204;
+      break;
+
+    default:
+      return;  
+  }
+
+  commandCount++;
+}
+void handleMessage(uint8_t* payload, size_t length) {
+  StaticJsonDocument<JSON_DOC_SIZE> doc;
+
+  DeserializationError error = deserializeJson(doc, payload, length);
+
+  
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
+    sendErrorMessage(error.c_str());
+    return;
+  }
+
+  if (!doc["type"].is<const char*>()) {
+    sendErrorMessage("invalid message type format");
+    return;
+  }
+
+  if (strcmp(doc["type"], "cmd") == 0) {
+    if (!doc["body"].is<JsonObject>()) {
+      sendErrorMessage("invalid command body");
+      return;
+    }
+
+    if (strcmp(doc["body"]["type"], "pinMode") == 0) {
+
+
+      //pinMode(doc["body"]["pin"], toMode(doc["body"]["mode"]));
+      sendCommandArray(doc["body"]["pin"]);
+      sendOkMessage();
+      return;
+    }
+
+    if (strcmp(doc["body"]["type"], "digitalWrite") == 0) {
+      //digitalWrite(doc["body"]["pin"], doc["body"]["value"]);
+      sendCommandArray(doc["body"]["pin"]);
+      sendOkMessage();
+      return;
+    }
+
+    if (strcmp(doc["body"]["type"], "digitalRead") == 0) {
+      auto value = digitalRead(doc["body"]["pin"]);
+      sendCommandArray(doc["body"]["pin"]);
+
+      char msg[MSG_SIZE];
+
+      sprintf(msg, "{\"action\":\"msg\",\"type\":\"output\",\"body\":%d}", value);
+
+      wsClient.sendTXT(msg);
+      return;
+    }
+
+    sendErrorMessage("unsupported command type");
+    return;
+  }
+
+  sendErrorMessage("unsupported message type");
+  return;
+}
+void onWSEvent(WStype_t type, uint8_t* payload, size_t length) {
+
+  switch (type) {
+    case WStype_CONNECTED:
+
+
+
+      Serial.println("WS Connected");
+
+      wsClient.sendTXT("{\"action\":\"register\","
+                       "\"clientId\":\"aquarium-esp32\"}");
+      Serial.println("ESP32 registration sent");
+
+
+      break;
+
+    case WStype_DISCONNECTED:
+      Serial.println("WS Disconnected");
+
+
+      break;
+
+    case WStype_TEXT:
+      Serial.printf("WS Message: %.*s\n", static_cast<int>(length), reinterpret_cast<char*>(payload));
+
+      
+      handleMessage(payload, length);
+      break;
+
+    case WStype_ERROR:
+      Serial.println("WS Error");
+      break;
+
+    default:
+      break;
+  }
+}
+void checkWiFiStatus() {
+  
+  const int wifiAreaWidth = 58;
+  tft.fillRect(0, 1, wifiAreaWidth, headerHeight - 2, HEADER_COLOR);
+  tft.setTextDatum(ML_DATUM);
+
+  if (wifiMulti.run() == WL_CONNECTED) {
+    tft.setTextColor(TFT_GREEN, HEADER_COLOR);
+    tft.drawString("ONLINE", 5, headerHeight / 2, 1);
+  } else {
+    tft.setTextColor(TFT_RED, HEADER_COLOR);
+    tft.drawString("OFFLINE", 5, headerHeight / 2, 1);
+  }
+
+  tft.setTextDatum(TL_DATUM);
+}
+
+const int FUNCTION_rowHeight = 38;
+const int FUNCTION_rowGap = 5;
+
+int functionScrollOffset = 0;
+int functionMaximumScroll = 0;
+int graphMaximumScroll = 0;
+int waterChangeScrollOffset = 0;
+int graphScrollOffset = 0;
+int waterChangeMaximumScroll = 0;
+int sendGallons = 1;
+
+
+bool fingerWasDown = false;
+bool fingerMoved = false;
+
+uint16_t touchStartX = 0;
+uint16_t touchStartY = 0;
+
+uint16_t lastTouchX = 0;
+uint16_t lastTouchY = 0;
+
+const int SCROLL_THRESHOLD = 3;
+
+
+unsigned long scrollStoppedTime = 0;
+const unsigned long TOUCH_WAIT_AFTER_SCROLL = 500;
+
+
+
+const int GRAPH_POINTS = 10;
+
+float graphValues[GRAPH_POINTS] = {
+  76.2,
+  76.8,
+  77.1,
+  76.9,
+  77.4,
+  77.8,
+  77.5,
+  77.2,
+  77.6,
+  77.9
+};
+
+void drawHeader(const char* title) {
+  tft.fillRect(0, 0, screenWidth, headerHeight, HEADER_COLOR);
+  tft.drawFastHLine(0, headerHeight - 1, screenWidth, BORDER_COLOR);
+
+ 
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TEXT_COLOR, HEADER_COLOR);
+  tft.drawString(title, screenWidth / 2, headerHeight / 2, 2);
+
+  
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextColor(TFT_GREEN, HEADER_COLOR);
+
+  char activityText[32];
+
+  if (inDrain) {
+    snprintf(activityText, sizeof(activityText), "DRAINING %.1f gal", systemInfo.drainGallons);
+    tft.drawString(activityText, screenWidth - 5, headerHeight / 2, 1);
+  } else if (inFill) {
+    snprintf(activityText, sizeof(activityText), "FILLING %.1f gal", systemInfo.fillGallons);
+    tft.drawString(activityText, screenWidth - 5, headerHeight / 2, 1);
+  } else if (reservoirFillingInProgress) {
+    tft.drawString("RESERVOIR FILL", screenWidth - 5, headerHeight / 2, 1);
+  } else if (inTransfer) {
+    tft.drawString("TRANSFERRING", screenWidth - 5, headerHeight / 2, 1);
+  }
+
+  tft.setTextDatum(TL_DATUM);
+
+  
+  checkWiFiStatus();
+}
+
+
+
+/* if (emergencyStop) {
+    timer();
+    if (millis() - startTime < 5000) {
+      tft.setTextColor(TFT_RED);
+      tft.drawString("STOPPED", screenWidth - 50, headerHeight / 2, 2);
+    }
+  }
+
+  tft.setTextDatum(TL_DATUM);
+}
+*/
+
+void drawHeaderWithPage() {
+  if (currentPage == homePage) {
+    drawHeader("AQUARIUM CONTROL");
+  } else if (currentPage == sensorsPage) {
+    drawHeader("SENSORS");
+
+  } else if (currentPage == devicePage) {
+    drawHeader("FUNCTIONS");
+
+  } else if (currentPage == graphPage) {
+    drawHeader("GRAPHS");
+  } else if (currentPage == mainFunctionPage) {
+    drawHeader("FUNCTIONS");
+  } else if (currentPage == waterChangePage) {
+    drawHeader("WATER CHANGE");
+  }
+}
+void drawFooter() {
+  int footerY = screenHeight - footerHeight;
+  int sectionWidth = screenWidth / 4;
+
+  tft.fillRect(0, footerY, screenWidth, footerHeight, FOOTER_COLOR);
+
+  tft.drawFastHLine(0, footerY, screenWidth, BORDER_COLOR);
+
+  const char* labels[4] = { "HOME", "SENSORS", "FUNCTION", "DATA" };
+
+  for (int i = 0; i < 4; i++) {
+    int centerX = i * sectionWidth + sectionWidth / 2;
+
+    bool selected = (currentPage == homePage && i == 0) || (currentPage == sensorsPage && i == 1) || (currentPage == devicePage && i == 2) || (currentPage == graphPage && i == 3);
+
+    if (selected) {
+      tft.setTextColor(ACCENT_COLOR, FOOTER_COLOR);
+    } else {
+      tft.setTextColor(MUTED_COLOR, FOOTER_COLOR);
+    }
+
+    tft.setTextDatum(MC_DATUM);
+
+    tft.drawString(labels[i], centerX, footerY + footerHeight / 2, 1);
+  }
+
+  tft.setTextDatum(TL_DATUM);
+}
+
+
+void drawHomePage() {
+  drawHeader("AQUARIUM CONTROL");
+  drawFooter();
+
+  int availableHeight = screenHeight - headerHeight - footerHeight;
+
+  int buttonGap = 8;
+  int outerMargin = 10;
+
+  int buttonWidth = (screenWidth - outerMargin * 2 - buttonGap * 2) / 3;
+
+  int buttonHeight = 90;
+
+  int buttonY = headerHeight + (availableHeight - buttonHeight) / 2;
+
+  drawHomeButton(outerMargin, buttonY, buttonWidth, buttonHeight, "SENSORS", "View readings", TFT_CYAN);
+
+  drawHomeButton(outerMargin + buttonWidth + buttonGap, buttonY, buttonWidth, buttonHeight, "FUNCTION", "Control devices", TFT_GREEN);
+
+  drawHomeButton(outerMargin + (buttonWidth + buttonGap) * 2, buttonY, buttonWidth, buttonHeight, "DATA", "View graphs", TFT_MAGENTA);
+}
+
+void drawHomeButton(int x, int y, int width, int height, const char* title, const char* subtitle, uint16_t color) {
+  tft.fillRoundRect(x, y, width, height, 8, CARD_COLOR);
+
+  tft.drawRoundRect(x, y, width, height, 8, color);
+
+  tft.setTextDatum(MC_DATUM);
+
+  tft.setTextColor(color, CARD_COLOR);
+
+  tft.drawString(title, x + width / 2, y + height / 2 - 10, 2);
+
+  tft.setTextColor(MUTED_COLOR, CARD_COLOR);
+
+  tft.drawString(subtitle, x + width / 2, y + height / 2 + 16, 1);
+
+  tft.setTextDatum(TL_DATUM);
+}
+
+void calculateMaximumScroll() {
+  int visibleHeight = screenHeight - headerHeight - footerHeight;
+
+  int contentHeight = sensorCount * rowHeight + (sensorCount - 1) * rowGap;
+
+  maximumScroll = max(0, contentHeight - visibleHeight);
+}
+
+void checkMainFunctionPageTouch(int x, int y) {
+  int availableHeight = screenHeight - headerHeight - footerHeight;
+
+  int buttonGap = 8;
+  int outerMargin = 10;
+
+  int buttonWidth = (screenWidth - outerMargin * 2 - buttonGap * 2) / 3;
+
+  int buttonHeight = 90;
+
+  int buttonY = headerHeight + (availableHeight - buttonHeight) / 2;
+  int buttonx = ((screenWidth / 2) - buttonWidth);
+
+  if (x >= buttonx && x <= (buttonx + buttonWidth) && y >= buttonY && y <= (buttonY + buttonHeight)) {
+    currentPage = devicePage;
+    //drawCurrentPage();
+    Serial.print("\ndevice page selected\n");
+    drawCurrentPage();
+  } else if (x >= (buttonx + buttonWidth + buttonGap) && x <= ((buttonx + buttonWidth + buttonGap) + buttonWidth) && y >= buttonY && y <= (buttonY + buttonHeight)) {
+    currentPage = waterChangePage;
+    drawCurrentPage();
+    Serial.print("\nwater change page selected\n");
+  }
+}
+void drawMainFunctionPagebutton(int x, int y, int width, int height, const char* title, const char* subtitle, uint16_t color) {
+  tft.fillRoundRect(x, y, width, height, 8, CARD_COLOR);
+
+  tft.drawRoundRect(x, y, width, height, 8, color);
+
+  tft.setTextDatum(MC_DATUM);
+
+  tft.setTextColor(color, CARD_COLOR);
+
+  tft.drawString(title, x + width / 2, y + height / 2 - 10, 2);
+
+  tft.setTextColor(MUTED_COLOR, CARD_COLOR);
+
+  tft.drawString(subtitle, x + width / 2, y + height / 2 + 16, 1);
+
+  tft.setTextDatum(TL_DATUM);
+}
+void drawMainFunctionPage() {
+  drawHeader("FUNCTIONS");
+  drawFooter();
+
+
+  int availableHeight = screenHeight - headerHeight - footerHeight;
+
+  int buttonGap = 8;
+  int outerMargin = 10;
+
+  int buttonWidth = (screenWidth - outerMargin * 2 - buttonGap * 2) / 3;
+
+  int buttonHeight = 90;
+
+  int buttonY = headerHeight + (availableHeight - buttonHeight) / 2;
+  int buttonx = ((screenWidth / 2) - buttonWidth);
+
+  drawMainFunctionPagebutton(buttonx, buttonY, buttonWidth, buttonHeight, "Devices", "Turn on/off", TFT_CYAN);
+
+  drawMainFunctionPagebutton(buttonx + buttonWidth + buttonGap, buttonY, buttonWidth, buttonHeight, "Water change", "Controls", TFT_GREEN);
+
+  //drawHomeButton(buttonY,buttonWidth,buttonHeight,"DATA","View graphs",TFT_MAGENTA);
+}
+void drawSensorRow(int sensorIndex, int rowY) {
+  int rowWidth = screenWidth - sideMargin * 2 - 5;
+
+  tft.fillRoundRect(sideMargin, rowY, rowWidth, rowHeight, 5, CARD_COLOR);
+
+  tft.drawRoundRect(sideMargin, rowY, rowWidth, rowHeight, 5, BORDER_COLOR);
+
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(TEXT_COLOR, CARD_COLOR);
+
+  tft.drawString(sensorNames[sensorIndex], sideMargin + 8, rowY + rowHeight / 2, 1);
+
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextColor(ACCENT_COLOR, CARD_COLOR);
+  if (sensorIndex != 3 && sensorIndex != 4) {
+    tft.drawFloat(systemInfo.parameters[sensorIndex], 1, screenWidth - sideMargin - 13, rowY + rowHeight / 2, 2);
+  } else {
+    if (systemInfo.parameters[sensorIndex] == 1) {
+      tft.drawString("NORMAL", screenWidth - sideMargin - 13, rowY + rowHeight / 2, 2);
+    } else {
+      tft.drawString("LOW", screenWidth - sideMargin - 13, rowY + rowHeight / 2, 2);
+    }
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+
+
+void calculateWaterChangeMaximumScroll() {
+  int visibleHeight = screenHeight - headerHeight - footerHeight;
+
+  int contentHeight = waterChangeFunctions * FUNCTION_rowHeight + (waterChangeFunctions - 1) * FUNCTION_rowGap;
+
+  waterChangeMaximumScroll = max(0, contentHeight - visibleHeight);
+}
+void drawWaterChangeScrollBar(int visibleHeight) {
+  if (waterChangeMaximumScroll <= 0) {
+    return;
+  }
+
+  int contentHeight = waterChangeFunctions * FUNCTION_rowHeight + (2) * FUNCTION_rowGap;
+
+  int barWidth = 3;
+
+  int barHeight = ((long)visibleHeight * visibleHeight) / contentHeight;
+
+  barHeight = max(barHeight, 15);
+
+  int travel = visibleHeight - barHeight;
+
+  int barY = ((long)waterChangeScrollOffset * travel) / waterChangeMaximumScroll;
+
+  int barX = screenWidth - barWidth;
+
+  tft.fillRect(barX, 0, barWidth, visibleHeight, 0x2104);
+
+  tft.fillRoundRect(barX, barY, barWidth, barHeight, 2, ACCENT_COLOR);
+}
+void drawWaterChangeButton(int x, int y, int width, int height, const char* label, int changeMode) {
+  tft.fillRoundRect(x, y, width, height, 6, CARD_COLOR);
+
+  tft.drawRoundRect(x, y, width, height, 6, BORDER_COLOR);
+
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(TEXT_COLOR, CARD_COLOR);
+
+  tft.drawString(label, x + 10, y + height / 2, 1);
+
+  tft.setTextDatum(MR_DATUM);
+  if (changeMode == 1) {
+    tft.setTextColor(ON_COLOR, CARD_COLOR);
+
+    tft.drawString("In progress", x + width - 10, y + height / 2, 2);
+  } else {
+    tft.setTextColor(TEXT_COLOR, CARD_COLOR);
+
+    tft.drawString("Start", x + width - 10, y + height / 2, 2);
+  }
+
+  tft.setTextDatum(TL_DATUM);
+}
+void drawWaterChangeScrollableArea() {
+  int areaY = headerHeight;
+
+  int areaHeight = screenHeight - headerHeight - footerHeight;
+
+  tft.setViewport(0, areaY, screenWidth, areaHeight, true);
+
+  tft.fillScreen(BACKGROUND_COLOR);
+
+  for (int i = 0; i < waterChangeFunctions; i++) {
+    int rowY = i * (FUNCTION_rowHeight + FUNCTION_rowGap) - waterChangeScrollOffset;
+
+    if (rowY + FUNCTION_rowHeight > 0 && rowY < areaHeight) {
+      drawWaterChangeButton(10, rowY, screenWidth - 20, FUNCTION_rowHeight, systemInfo.WaterChangeFunctionNames[i], systemInfo.waterChangeStatusArr[i]);
+    }
+  }
+  //drawFunctionScrollBar(areaHeight);
+  drawWaterChangeScrollBar(areaHeight);
+
+  tft.resetViewport();
+}
+void checkWaterChangePopUpTouch(int x, int y) {
+  int popUpHeight = 100;
+  int popUpLength = 200;
+  int popUpX = (screenWidth / 2) - (popUpLength / 2);
+  int popUpy = (screenHeight / 2) - (popUpHeight / 2);
+  int textDatum = (popUpLength / 2);
+  if (x < popUpX || x > (popUpX + popUpLength) || y < popUpy || y > (popUpy + popUpLength)) {
+    currentPage = waterChangePage;
+    Serial.print("change not confirmed");
+    drawCurrentPage();
+    return;
+  }
+  if (x > (popUpX + 30) && x < ((popUpX + popUpLength) - 30) && y > ((popUpy + popUpLength) / 2) && y < ((popUpy + popUpLength) - 10)) {
+    systemInfo.waterChangeStatusArr[0] = 1;
+    Serial.print("change confirmed");
+    currentPage = waterChangePage;
+    sendCommandArray(100);
+    drawCurrentPage();
+  }
+}
+void checkReservoirFillPopUpTouch(int x, int y) {
+  int popUpHeight = 100;
+  int popUpLength = 200;
+  int popUpX = (screenWidth / 2) - (popUpLength / 2);
+  int popUpy = (screenHeight / 2) - (popUpHeight / 2);
+  int textDatum = (popUpLength / 2);
+  if (x < popUpX || x > (popUpX + popUpLength) || y < popUpy || y > (popUpy + popUpLength)) {
+    currentPage = waterChangePage;
+    Serial.print("reservoir fill not confirmed");
+    drawCurrentPage();
+    return;
+  }
+  if (x > (popUpX + 30) && x < ((popUpX + popUpLength) - 30) && y > ((popUpy + popUpLength) / 2) && y < ((popUpy + popUpLength) - 10)) {
+    systemInfo.waterChangeStatusArr[4] = 1;
+    Serial.print("reservoir fill confirmed");
+    currentPage = waterChangePage;
+    //sendCommandArray(100);
+    drawCurrentPage();
+    sendCommandArray(151);
+    reservoirFillingInProgress = true;
+    //timer();
+    //machineDelay();
+  }
+}
+void DrawaterChangePopUp(int32_t x, int32_t y, int32_t length, int32_t height, uint32_t color, int datum) {
+  tft.fillRect(x, y, length, height, color);
+  tft.drawRect(x, y, length, height, ACCENT_COLOR);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TEXT_COLOR, color);
+
+  tft.drawString("Start water change?", x + length / 2, y + height / 2 - 20, 2);
+
+  tft.drawString("confirm", x + length / 2, y + height / 2 + 15, 1);
+
+  tft.setTextDatum(TL_DATUM);
+}
+void DrawReservoirFillPopUp(int32_t x, int32_t y, int32_t length, int32_t height, uint32_t color, int datum) {
+  tft.fillRect(x, y, length, height, color);
+  tft.drawRect(x, y, length, height, ACCENT_COLOR);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TEXT_COLOR, color);
+
+  tft.drawString("Start reservoir fill?", x + length / 2, y + height / 2 - 20, 2);
+
+  tft.drawString("confirm", x + length / 2, y + height / 2 + 15, 1);
+
+  tft.setTextDatum(TL_DATUM);
+}
+void DrawFillPopUp(int32_t x, int32_t y, int32_t length, uint32_t height, uint32_t color, int textDatum) {
+  tft.fillRect(x, y, length, height, color);
+  tft.drawRect(x, y, length, height, ACCENT_COLOR);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TEXT_COLOR, color);
+
+  tft.drawString("Gallons = ", x + length / 2, y + height / 2 - 20, 2);
+
+  tft.drawString("-", x + 25, y + height / 2 - 20, 2);
+
+  tft.drawString("+", x + length - 25, y + height / 2 - 20, 2);
+  //tft.fillRect((x+length)-15, (height/2)-10, length-8, 15, TFT_BLACK);
+  tft.drawNumber(sendGallons, (x + length) - 50, y + height / 2 - 20, 2);
+  tft.drawString("confirm", x + length / 2, y + height / 2 + 20, 1);
+
+  tft.setTextDatum(TL_DATUM);
+}
+void checkFillPopUpTouch(int x, int y) {
+  int gallons = 1;
+  int touch = 0;
+  int popUpHeight = 100;
+  int popUpLength = 200;
+  int popUpX = (screenWidth / 2) - (popUpLength / 2);
+  int popUpy = (screenHeight / 2) - (popUpHeight / 2);
+  int textDatum = (popUpLength / 2);
+
+  if (x < popUpX || x > (popUpX + popUpLength) || y < popUpy || y > (popUpy + popUpLength)) {
+    currentPage = waterChangePage;
+    Serial.print("fill not confirmed");
+    drawCurrentPage();
+    return;
+  }
+  if (x > popUpX && x < (((popUpX + popUpLength) / 2) - 15) && y > popUpy && y < (popUpy + (popUpHeight / 2))) {
+    if (sendGallons == 1) {
+      return;
+    } else if (sendGallons == 5) {
+      sendGallons = 1;
+
+    } else if (sendGallons == 10) {
+      sendGallons = 5;
+    }
+    DrawFillPopUp(popUpX, popUpy, popUpLength, popUpHeight, TFT_BLACK, textDatum);
+  } else if (x > (popUpX + (popUpLength / 2)) + 15 && x < (popUpX + popUpLength) && y > popUpy && y < (popUpy + (popUpHeight / 2))) {
+    if (sendGallons == 10) {
+      return;
+    } else if (sendGallons == 5) {
+      sendGallons = 10;
+    } else if (sendGallons == 1) {
+      sendGallons = 5;
+    }
+    DrawFillPopUp(popUpX, popUpy, popUpLength, popUpHeight, TFT_BLACK, textDatum);
+  }
+  if (x > (popUpX + 30) && x < ((popUpX + popUpLength) - 30) && y > ((popUpy + popUpLength) / 2) && y < ((popUpy + popUpLength) - 10)) {
+    Serial.print("\nFill confirmed\n");
+
+    //sendCommandArray(100);
+    if (sendGallons == 1) {
+      sendCommandArray(121);
+    } else if (sendGallons == 5) {
+      sendCommandArray(122);
+    } else if (sendGallons == 10) {
+      sendCommandArray(123);
+    }
+   
+    sendData();
+    Serial.print("\ngallons sent\n");
+    Serial.print(sendGallons);
+    currentPage = waterChangePage;
+    systemInfo.waterChangeStatusArr[1] = 1;
+    drawCurrentPage();
+    sendGallons = 1;
+  }
+}
+void DrawDrainPopUp(int32_t x, int32_t y, int32_t length, uint32_t height, uint32_t color, int textDatum) {
+  tft.fillRect(x, y, length, height, color);
+  tft.drawRect(x, y, length, height, ACCENT_COLOR);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TEXT_COLOR, color);
+
+  tft.drawString("Gallons = ", x + length / 2, y + height / 2 - 20, 2);
+
+  tft.drawString("-", x + 25, y + height / 2 - 20, 2);
+
+  tft.drawString("+", x + length - 25, y + height / 2 - 20, 2);
+  //tft.fillRect((x+length)-15, (height/2)-10, length-8, 15, TFT_BLACK);
+  tft.drawNumber(sendGallons, (x + length) - 50, y + height / 2 - 20, 2);
+  tft.drawString("confirm", x + length / 2, y + height / 2 + 20, 1);
+
+  tft.setTextDatum(TL_DATUM);
+}
+void checkDrainPopUpTouch(int x, int y) {
+  int gallons = 1;
+  int touch = 0;
+  int popUpHeight = 100;
+  int popUpLength = 200;
+  int popUpX = (screenWidth / 2) - (popUpLength / 2);
+  int popUpy = (screenHeight / 2) - (popUpHeight / 2);
+  int textDatum = (popUpLength / 2);
+
+  if (x < popUpX || x > (popUpX + popUpLength) || y < popUpy || y > (popUpy + popUpLength)) {
+    currentPage = waterChangePage;
+    Serial.print("drain not confirmed");
+    drawCurrentPage();
+    return;
+  }
+  if (x > popUpX && x < (((popUpX + popUpLength) / 2) - 15) && y > popUpy && y < (popUpy + (popUpHeight / 2))) {
+    if (sendGallons == 1) {
+      return;
+    } else if (sendGallons == 5) {
+      sendGallons = 1;
+
+    } else if (sendGallons == 10) {
+      sendGallons = 5;
+    }
+    DrawDrainPopUp(popUpX, popUpy, popUpLength, popUpHeight, TFT_BLACK, textDatum);
+  } else if (x > (popUpX + (popUpLength / 2)) + 15 && x < (popUpX + popUpLength) && y > popUpy && y < (popUpy + (popUpHeight / 2))) {
+    if (sendGallons == 10) {
+      return;
+    } else if (sendGallons == 5) {
+      sendGallons = 10;
+    } else if (sendGallons == 1) {
+      sendGallons = 5;
+    }
+    DrawDrainPopUp(popUpX, popUpy, popUpLength, popUpHeight, TFT_BLACK, textDatum);
+  }
+  if (x > (popUpX + 30) && x < ((popUpX + popUpLength) - 30) && y > ((popUpy + popUpLength) / 2) && y < ((popUpy + popUpLength) - 10)) {
+    Serial.print("\ndrain confirmed\n");
+
+    //sendCommandArray(100);
+    if (sendGallons == 1) {
+      sendCommandArray(131);
+    } else if (sendGallons == 5) {
+      sendCommandArray(132);
+    } else if (sendGallons == 10) {
+      sendCommandArray(133);
+    }
+    
+    sendData();
+    Serial.print("\ngallons sent\n");
+    Serial.print(sendGallons);
+    currentPage = waterChangePage;
+    systemInfo.waterChangeStatusArr[2] = 1;
+    drawCurrentPage();
+    sendGallons = 1;
+  }
+}
+void DrawTransferPopUp(int32_t x, int32_t y, int32_t length, uint32_t height, uint32_t color, int textDatum) {
+  tft.fillRect(x, y, length, height, color);
+  tft.drawRect(x, y, length, height, ACCENT_COLOR);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TEXT_COLOR, color);
+
+  tft.drawString("Gallons = ", x + length / 2, y + height / 2 - 20, 2);
+
+  tft.drawString("-", x + 25, y + height / 2 - 20, 2);
+
+  tft.drawString("+", x + length - 25, y + height / 2 - 20, 2);
+  //tft.fillRect((x+length)-15, (height/2)-10, length-8, 15, TFT_BLACK);
+  tft.drawNumber(sendGallons, (x + length) - 50, y + height / 2 - 20, 2);
+  tft.drawString("confirm", x + length / 2, y + height / 2 + 20, 1);
+
+  tft.setTextDatum(TL_DATUM);
+}
+void checkTransferPopUpTouch(int x, int y) {
+  int gallons = 1;
+  int touch = 0;
+  int popUpHeight = 100;
+  int popUpLength = 200;
+  int popUpX = (screenWidth / 2) - (popUpLength / 2);
+  int popUpy = (screenHeight / 2) - (popUpHeight / 2);
+  int textDatum = (popUpLength / 2);
+
+  if (x < popUpX || x > (popUpX + popUpLength) || y < popUpy || y > (popUpy + popUpLength)) {
+    currentPage = waterChangePage;
+    Serial.print("transfer not confirmed");
+    drawCurrentPage();
+    return;
+  }
+  if (x > (popUpX + 30) && x < ((popUpX + popUpLength) - 30) && y > ((popUpy + popUpLength) / 2) && y < ((popUpy + popUpLength) - 10)) {
+    Serial.print("\ntransfer confirmed\n");
+    sendCommandArray(141);
+    currentPage = waterChangePage;
+    systemInfo.waterChangeStatusArr[3] = 1;
+    drawCurrentPage();
+  }
+}
+void drawWaterChangeFunction(int selectedFunction) {
+
+
+  int popUpHeight = 100;
+  int popUpLength = 200;
+  int popUpX = (screenWidth / 2) - (popUpLength / 2);
+  int popUpy = (screenHeight / 2) - (popUpHeight / 2);
+  int textDatum = (popUpLength / 2);
+  switch (selectedFunction) {
+    case (0):
+      currentPage = waterChangePopUp;
+      DrawaterChangePopUp(popUpX, popUpy, popUpLength, popUpHeight, TFT_BLACK, textDatum);
+      break;
+    case (1):
+      currentPage = fillPopUp;
+      DrawFillPopUp(popUpX, popUpy, popUpLength, popUpHeight, TFT_BLACK, textDatum);
+      break;
+    case (2):
+      currentPage = drainPopUp;
+      DrawDrainPopUp(popUpX, popUpy, popUpLength, popUpHeight, TFT_BLACK, textDatum);
+      break;
+    case (3):
+      currentPage = transferPopUp;
+      DrawTransferPopUp(popUpX, popUpy, popUpLength, popUpHeight, TFT_BLACK, textDatum);
+      break;
+    case (4):
+      currentPage = reservoirFillpopUp;
+      DrawReservoirFillPopUp(popUpX, popUpy, popUpLength, popUpHeight, TFT_BLACK, textDatum);
+      break;
+  }
+}
+void emergencyStopFunction(int selectedFunction) {
+
+  
+  resetDrainFlowCounter();
+  resetFillFlowCounter();
+  countDrainFlow = false;
+  countFillFlow = false;
+  automaticWaterChangeCounting = false;
+
+  systemInfo.waterChangeStatusArr[selectedFunction] = 0;
+  if (selectedFunction == 0) {
+    sendCommandArray(200);
+  } else if (selectedFunction == 1) {
+    sendCommandArray(201);
+
+  } else if (selectedFunction == 2) {
+    sendCommandArray(202);
+  } else if (selectedFunction == 3) {
+    sendCommandArray(203);
+  } else if (selectedFunction == 4) {
+    sendCommandArray(204);
+  }
+
+  emergencyStop = true;
+  
+  inDrain = false;
+  inFill = false;
+  inTransfer = false;
+  reservoirFillingInProgress = false;
+  drawHeader("WATER CHANGE");
+  drawCurrentPage();
+
+  sendData();
+}
+void checkWaterChangePageTouch(uint16_t x, uint16_t y) {
+  int listTop = headerHeight;
+
+  int listBottom = screenHeight - footerHeight;
+
+  if (y < listTop || y >= listBottom) {
+    return;
+  }
+  int toggleLeft = screenWidth - 70;
+  int toggleRight = screenWidth - 10;
+
+  if (x < toggleLeft || x > toggleRight) {
+    return;
+  }
+
+  
+  int contentY = y - listTop + waterChangeScrollOffset;
+
+  int rowSpace = FUNCTION_rowHeight + FUNCTION_rowGap;
+
+  int selectedFunction = contentY / rowSpace;
+
+  int positionInsideRow = contentY % rowSpace;
+
+  if (selectedFunction < 0 || selectedFunction >= waterChangeFunctions || positionInsideRow >= FUNCTION_rowHeight) {
+    return;
+  }
+  if (systemInfo.waterChangeStatusArr[selectedFunction] == 0) {
+    drawWaterChangeFunction(selectedFunction);
+  }
+  if (systemInfo.waterChangeStatusArr[selectedFunction] == 1) {
+    emergencyStopFunction(selectedFunction);
+    emergencyStop = false;
+  }
+
+  
+
+
+
+
+
+  // drawWaterChangeScrollableArea();
+}
+
+void drawWaterChangePage() {
+  drawHeader("WATER CHANGE");
+  drawFooter();
+  drawWaterChangeScrollableArea();
+}
+void drawGraphScrollBar(int visibleHeight) {
+  if (graphMaximumScroll <= 0) {
+    return;
+  }
+
+  int contentHeight = 5 * FUNCTION_rowHeight + (2) * FUNCTION_rowGap;
+
+  int barWidth = 3;
+
+  int barHeight = ((long)visibleHeight * visibleHeight) / contentHeight;
+
+  barHeight = max(barHeight, 15);
+
+  int travel = visibleHeight - barHeight;
+
+  int barY = ((long)graphScrollOffset * travel) / graphMaximumScroll;
+
+  int barX = screenWidth - barWidth;
+
+  tft.fillRect(barX, 0, barWidth, visibleHeight, 0x2104);
+
+  tft.fillRoundRect(barX, barY, barWidth, barHeight, 2, ACCENT_COLOR);
+}
+void drawGraphButton(int x, int y, int width, int height, const char* label) {
+  tft.fillRoundRect(x, y, width, height, 6, CARD_COLOR);
+
+  tft.drawRoundRect(x, y, width, height, 6, BORDER_COLOR);
+
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(TEXT_COLOR, CARD_COLOR);
+
+  tft.drawString(label, x + 10, y + height / 2, 1);
+
+  tft.setTextDatum(MR_DATUM);
+
+  tft.setTextDatum(TL_DATUM);
+}
+void drawMainGraphScrollableArea() {
+  int areaY = headerHeight;
+
+  int areaHeight = screenHeight - headerHeight - footerHeight;
+
+  tft.setViewport(0, areaY, screenWidth, areaHeight, true);
+
+  tft.fillScreen(BACKGROUND_COLOR);
+
+  for (int i = 0; i < 5; i++) {
+    int rowY = i * (FUNCTION_rowHeight + FUNCTION_rowGap) - graphScrollOffset;
+
+    if (rowY + FUNCTION_rowHeight > 0 && rowY < areaHeight) {
+      drawGraphButton(10, rowY, screenWidth - 20, FUNCTION_rowHeight, systemInfo.graphNames[i]);
+    }
+  }
+  //drawFunctionScrollBar(areaHeight);
+  drawGraphScrollBar(areaHeight);
+
+  tft.resetViewport();
+}
+void checkMainGraphPageTouch(uint16_t x, uint16_t y) {
+  int listTop = headerHeight;
+
+  int listBottom = screenHeight - footerHeight;
+
+  if (y < listTop || y >= listBottom) {
+    return;
+  }
+
+
+  
+  int contentY = y - listTop + graphScrollOffset;
+
+  int rowSpace = FUNCTION_rowHeight + FUNCTION_rowGap;
+
+  int selectedFunction = contentY / rowSpace;
+
+  int positionInsideRow = contentY % rowSpace;
+
+  if (selectedFunction < 0 || selectedFunction >= 5 || positionInsideRow >= FUNCTION_rowHeight) {
+    return;
+  }
+  currentPage = graphPage;
+  drawGraphPage(selectedFunction);
+
+  //systemInfo.statusArr[selectedFunction] = (systemInfo.statusArr[selectedFunction]==1)?0:1;
+  //sendCommandArray(selectedFunction);
+  //select graph
+  //sendData();
+
+
+
+
+
+  //drawMainGraphScrollableArea();
+}
+
+void drawMainGraphPage() {
+  drawHeader("GRAPHS");
+  drawFooter();
+  drawMainGraphScrollableArea();
+}
+void drawFunctionsPage() {
+  drawHeader("FUNCTIONS");
+  drawFooter();
+  drawFunctionScrollableArea();
+}
+
+
+
+void calculateFunctionMaximumScroll() {
+  int visibleHeight = screenHeight - headerHeight - footerHeight;
+
+  int contentHeight = functionCount * FUNCTION_rowHeight + (functionCount - 1) * FUNCTION_rowGap;
+
+  functionMaximumScroll = max(0, contentHeight - visibleHeight);
+}
+void calculateGraphMaximumScroll() {
+  int visibleHeight = screenHeight - headerHeight - footerHeight;
+
+  int contentHeight = 5 * FUNCTION_rowHeight + (5 - 1) * FUNCTION_rowGap;
+
+  graphMaximumScroll = max(0, contentHeight - visibleHeight);
+}
+
+void drawFunctionButton(int x, int y, int width, int height, const char* label, int isOn) {
+  tft.fillRoundRect(x, y, width, height, 6, CARD_COLOR);
+
+  tft.drawRoundRect(x, y, width, height, 6, BORDER_COLOR);
+
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(TEXT_COLOR, CARD_COLOR);
+
+  tft.drawString(label, x + 10, y + height / 2, 1);
+
+  tft.setTextDatum(MR_DATUM);
+  if (isOn == 2) {
+    tft.setTextColor(ON_COLOR, CARD_COLOR);
+
+    tft.drawString("PENDING", x + width - 10, y + height / 2, 2);
+  } else if (isOn == 1) {
+    tft.setTextColor(ON_COLOR, CARD_COLOR);
+
+    tft.drawString("ON", x + width - 10, y + height / 2, 2);
+  } else if (isOn == 0) {
+    tft.setTextColor(OFF_COLOR, CARD_COLOR);
+
+    tft.drawString("OFF", x + width - 10, y + height / 2, 2);
+  }
+
+  tft.setTextDatum(TL_DATUM);
+}
+void drawFunctionScrollableArea() {
+  int areaY = headerHeight;
+
+  int areaHeight = screenHeight - headerHeight - footerHeight;
+
+  tft.setViewport(0, areaY, screenWidth, areaHeight, true);
+
+  tft.fillScreen(BACKGROUND_COLOR);
+
+  for (int i = 0; i < functionCount; i++) {
+    int rowY = i * (FUNCTION_rowHeight + FUNCTION_rowGap) - functionScrollOffset;
+
+    if (rowY + FUNCTION_rowHeight > 0 && rowY < areaHeight) {
+      drawFunctionButton(10, rowY, screenWidth - 20, FUNCTION_rowHeight, systemInfo.functionNames[i], systemInfo.statusArr[i]);
+    }
+  }
+  drawFunctionScrollBar(areaHeight);
+
+  tft.resetViewport();
+}
+
+void drawScrollableArea() {
+  int areaY = headerHeight;
+
+  int areaHeight = screenHeight - headerHeight - footerHeight;
+
+  tft.setViewport(0, areaY, screenWidth, areaHeight, true);
+
+  tft.fillScreen(BACKGROUND_COLOR);
+
+  for (int i = 0; i < sensorCount; i++) {
+    int rowY = i * (rowHeight + rowGap) - scrollOffset;
+
+    if (rowY + rowHeight > 0 && rowY < areaHeight) {
+      drawSensorRow(i, rowY);
+    }
+  }
+
+  drawScrollBar(areaHeight);
+
+  tft.resetViewport();
+}
+void drawScrollBar(int visibleHeight) {
+  if (maximumScroll <= 0) {
+    return;
+  }
+  int contentHeight = sensorCount * rowHeight + (sensorCount - 1) * rowGap;
+
+  int barWidth = 3;
+
+  int barHeight = ((long)visibleHeight * visibleHeight) / contentHeight;
+
+  barHeight = max(barHeight, 15);
+
+  int travel = visibleHeight - barHeight;
+
+  int barY = ((long)scrollOffset * travel) / maximumScroll;
+
+  int barX = screenWidth - barWidth;
+
+  tft.fillRect(barX, 0, barWidth, visibleHeight, 0x2104);
+
+  tft.fillRoundRect(barX, barY, barWidth, barHeight, 2, ACCENT_COLOR);
+}
+void drawSensorsPage() {
+  drawHeader("SENSORS");
+  drawFooter();
+  drawScrollableArea();
+}
+
+
+void drawFunctionScrollBar(int visibleHeight) {
+  if (functionMaximumScroll <= 0) {
+    return;
+  }
+
+  int contentHeight = functionCount * FUNCTION_rowHeight + (functionCount - 1) * FUNCTION_rowGap;
+
+  int barWidth = 3;
+
+  int barHeight = ((long)visibleHeight * visibleHeight) / contentHeight;
+
+  barHeight = max(barHeight, 15);
+
+  int travel = visibleHeight - barHeight;
+
+  int barY = ((long)functionScrollOffset * travel) / functionMaximumScroll;
+
+  int barX = screenWidth - barWidth;
+
+  tft.fillRect(barX, 0, barWidth, visibleHeight, 0x2104);
+
+  tft.fillRoundRect(barX, barY, barWidth, barHeight, 2, ACCENT_COLOR);
+}
+
+
+void drawGraphPage(int selectedGraph) {
+
+  if (selectedGraph == 0) {
+    tft.resetViewport();
+    tft.fillScreen(BACKGROUND_COLOR);
+    drawHeader("TANK TEMP DATA");
+    drawFooter();
+
+    int graphX = 42;
+    int graphY = headerHeight + 10;
+    int graphWidth = screenWidth - graphX - 10;
+    int graphHeight = screenHeight - headerHeight - footerHeight - 20;
+    float sum = 0.0;
+
+    for (int i = 0; i < GRAPH_POINTS; i++) {
+      sum += tankTempData[i];
+    }
+    float average = sum / (float)GRAPH_POINTS;
+    int centerValue = round(average);
+    float graphMin = centerValue - 1.0;
+    float graphMax = centerValue + 1.0;
+    float graphRange = graphMax - graphMin;
+
+    tft.drawRect(graphX, graphY, graphWidth, graphHeight, BORDER_COLOR);
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(MUTED_COLOR, BACKGROUND_COLOR);
+
+    for (int i = 0; i <= 10; i++) {
+      float value = graphMin + (i * 0.2);
+      float normalized = (value - graphMin) / graphRange;
+      int lineY = graphY + graphHeight - (normalized * graphHeight);
+      tft.drawFastHLine(graphX, lineY, graphWidth, 0x2945);
+      tft.drawFloat(value, 1, graphX - 4, lineY, 1);
+    }
+
+    for (int i = 0; i < GRAPH_POINTS; i++) {
+      int pointX = graphX + ((float)i / (GRAPH_POINTS - 1)) * graphWidth;
+      tft.drawFastVLine(pointX, graphY, graphHeight, 0x2945);
+    }
+
+    for (int i = 0; i < GRAPH_POINTS - 1; i++) {
+      float value1 = tankTempData[i];
+      float value2 = tankTempData[i + 1];
+      float normalized1 = (value1 - graphMin) / graphRange;
+      float normalized2 = (value2 - graphMin) / graphRange;
+
+
+
+      int x1 = graphX + ((float)i / (GRAPH_POINTS - 1)) * graphWidth;
+
+      int x2 = graphX + ((float)(i + 1) / (GRAPH_POINTS - 1)) * graphWidth;
+
+
+
+      int y1 =
+        graphY
+        + graphHeight
+        - (normalized1
+           * graphHeight);
+
+      int y2 = graphY + graphHeight - (normalized2 * graphHeight);
+
+
+      tft.drawLine(x1, y1, x2, y2, ACCENT_COLOR);
+
+      tft.fillCircle(x1, y1, 2, ACCENT_COLOR);
+
+
+      if (i == GRAPH_POINTS - 2) {
+
+        tft.fillCircle(x2, y2, 2, ACCENT_COLOR);
+      }
+    }
+    float averageNormalized = (average - graphMin) / graphRange;
+    int averageY = graphY + graphHeight - (averageNormalized * graphHeight);
+
+    for (int x = graphX; x < graphX + graphWidth; x += 8) {
+
+      tft.drawFastHLine(x, averageY, 4, ACCENT_COLOR);
+    }
+
+
+
+    tft.setTextDatum(TL_DATUM);
+  }
+
+  else if (selectedGraph == 1) {
+
+    tft.resetViewport();
+    tft.fillScreen(BACKGROUND_COLOR);
+
+    drawHeader("SALT TEMP DATA");
+    drawFooter();
+
+
+    int graphX = 42;
+    int graphY = headerHeight + 10;
+
+    int graphWidth = screenWidth - graphX - 10;
+
+    int graphHeight = screenHeight - headerHeight - footerHeight - 20;
+
+    float sum = 0.0;
+
+    for (int i = 0; i < GRAPH_POINTS; i++) {
+      sum += saltReservoirTempData[i];
+    }
+
+    float average = sum / (float)GRAPH_POINTS;
+
+    int centerValue = round(average);
+
+    float graphMin = centerValue - 1.0;
+
+    float graphMax = centerValue + 1.0;
+
+    float graphRange = graphMax - graphMin;
+
+
+    tft.drawRect(graphX, graphY, graphWidth, graphHeight, BORDER_COLOR);
+
+    tft.setTextDatum(MR_DATUM);
+
+    tft.setTextColor(MUTED_COLOR, BACKGROUND_COLOR);
+
+
+    for (int i = 0; i <= 10; i++) {
+
+      float value = graphMin + (i * 0.2);
+
+      float normalized = (value - graphMin) / graphRange;
+
+      int lineY = graphY + graphHeight - (normalized * graphHeight);
+
+
+
+      tft.drawFastHLine(graphX, lineY, graphWidth, 0x2945);
+
+
+      tft.drawFloat(value, 1, graphX - 4, lineY, 1);
+    }
+
+    for (int i = 0; i < GRAPH_POINTS; i++) {
+
+      int pointX = graphX + ((float)i / (GRAPH_POINTS - 1)) * graphWidth;
+
+      tft.drawFastVLine(pointX, graphY, graphHeight, 0x2945);
+    }
+
+    for (int i = 0; i < GRAPH_POINTS - 1; i++) {
+
+
+      float value1 = saltReservoirTempData[i];
+
+
+      float value2 = saltReservoirTempData[i + 1];
+
+
+      float normalized1 = (value1 - graphMin) / graphRange;
+
+      float normalized2 = (value2 - graphMin) / graphRange;
+
+
+
+      int x1 = graphX + ((float)i / (GRAPH_POINTS - 1)) * graphWidth;
+
+      int x2 = graphX + ((float)(i + 1) / (GRAPH_POINTS - 1)) * graphWidth;
+
+
+
+      int y1 = graphY + graphHeight - (normalized1 * graphHeight);
+
+      int y2 = graphY + graphHeight - (normalized2 * graphHeight);
+
+
+
+      tft.drawLine(x1, y1, x2, y2, ACCENT_COLOR);
+
+
+
+      tft.fillCircle(x1, y1, 2, ACCENT_COLOR);
+
+
+
+      if (i == GRAPH_POINTS - 2) {
+
+        tft.fillCircle(x2, y2, 2, ACCENT_COLOR);
+      }
+    }
+
+    float averageNormalized = (average - graphMin) / graphRange;
+
+    int averageY = graphY + graphHeight - (averageNormalized * graphHeight);
+
+
+
+    for (int x = graphX; x < graphX + graphWidth; x += 8) {
+
+      tft.drawFastHLine(x, averageY, 4, ACCENT_COLOR);
+    }
+    tft.setTextDatum(TL_DATUM);
+  }
+
+  else if (selectedGraph == 2) {
+
+    tft.resetViewport();
+    tft.fillScreen(BACKGROUND_COLOR);
+
+    drawHeader("TANK PH");
+    drawFooter();
+
+
+    int graphX = 42;
+    int graphY = headerHeight + 10;
+
+    int graphWidth = screenWidth - graphX - 10;
+
+    int graphHeight = screenHeight - headerHeight - footerHeight - 20;
+    float sum = 0.0;
+
+    for (int i = 0; i < GRAPH_POINTS; i++) {
+      sum += phData[i];
+    }
+
+    float average = sum / (float)GRAPH_POINTS;
+
+    int centerValue = round(average);
+
+    float graphMin = centerValue - 1.0;
+
+    float graphMax = centerValue + 1.0;
+
+    float graphRange = graphMax - graphMin;
+
+
+    tft.drawRect(graphX, graphY, graphWidth, graphHeight, BORDER_COLOR);
+
+
+    tft.setTextDatum(MR_DATUM);
+
+    tft.setTextColor(MUTED_COLOR, BACKGROUND_COLOR);
+
+
+    for (int i = 0; i <= 10; i++) {
+
+      float value = graphMin + (i * 0.2);
+
+      float normalized = (value - graphMin) / graphRange;
+
+      int lineY = graphY + graphHeight - (normalized * graphHeight);
+
+
+
+      tft.drawFastHLine(graphX, lineY, graphWidth, 0x2945);
+
+
+
+      tft.drawFloat(value, 1, graphX - 4, lineY, 1);
+    }
+
+
+    for (int i = 0; i < GRAPH_POINTS; i++) {
+
+      int pointX = graphX + ((float)i / (GRAPH_POINTS - 1)) * graphWidth;
+
+      tft.drawFastVLine(pointX, graphY, graphHeight, 0x2945);
+    }
+
+    for (int i = 0; i < GRAPH_POINTS - 1; i++) {
+
+
+      float value1 = phData[i];
+
+
+      float value2 = phData[i + 1];
+
+      float normalized1 = (value1 - graphMin) / graphRange;
+
+      float normalized2 = (value2 - graphMin) / graphRange;
+
+
+      int x1 = graphX + ((float)i / (GRAPH_POINTS - 1)) * graphWidth;
+
+      int x2 = graphX + ((float)(i + 1) / (GRAPH_POINTS - 1)) * graphWidth;
+
+
+      int y1 = graphY + graphHeight - (normalized1 * graphHeight);
+
+      int y2 = graphY + graphHeight - (normalized2 * graphHeight);
+
+
+      tft.drawLine(x1, y1, x2, y2, ACCENT_COLOR);
+
+
+      tft.fillCircle(x1, y1, 2, ACCENT_COLOR);
+
+
+      if (i == GRAPH_POINTS - 2) {
+
+        tft.fillCircle(x2, y2, 2, ACCENT_COLOR);
+      }
+    }
+
+
+    float averageNormalized = (average - graphMin) / graphRange;
+
+    int averageY = graphY + graphHeight - (averageNormalized * graphHeight);
+
+    for (int x = graphX; x < graphX + graphWidth; x += 8) {
+
+      tft.drawFastHLine(x, averageY, 4, ACCENT_COLOR);
+    }
+    tft.setTextDatum(TL_DATUM);
+
+
+  }
+
+  else if (selectedGraph == 3) {
+
+    tft.resetViewport();
+    tft.fillScreen(BACKGROUND_COLOR);
+
+    drawHeader("TDS DATA");
+    drawFooter();
+
+
+    int graphX = 42;
+    int graphY = headerHeight + 10;
+
+    int graphWidth = screenWidth - graphX - 10;
+
+    int graphHeight = screenHeight - headerHeight - footerHeight - 20;
+
+    float sum = 0.0;
+
+    for (int i = 0; i < GRAPH_POINTS; i++) {
+      sum += tdsData[i];
+    }
+
+    float average = sum / (float)GRAPH_POINTS;
+
+    int centerValue = round(average);
+
+    float graphMin = centerValue - 1.0;
+
+    float graphMax = centerValue + 1.0;
+
+    float graphRange = graphMax - graphMin;
+
+    tft.drawRect(graphX, graphY, graphWidth, graphHeight, BORDER_COLOR);
+
+
+    tft.setTextDatum(MR_DATUM);
+
+    tft.setTextColor(MUTED_COLOR, BACKGROUND_COLOR);
+
+
+    for (int i = 0; i <= 10; i++) {
+
+      float value = graphMin + (i * 0.2);
+
+      float normalized = (value - graphMin) / graphRange;
+
+      int lineY = graphY + graphHeight - (normalized * graphHeight);
+
+      tft.drawFastHLine(graphX, lineY, graphWidth, 0x2945);
+
+
+      tft.drawFloat(value, 1, graphX - 4, lineY, 1);
+    }
+
+    for (int i = 0; i < GRAPH_POINTS; i++) {
+
+      int pointX = graphX + ((float)i / (GRAPH_POINTS - 1)) * graphWidth;
+
+      tft.drawFastVLine(pointX, graphY, graphHeight, 0x2945);
+    }
+
+    for (int i = 0; i < GRAPH_POINTS - 1; i++) {
+
+
+      float value1 = tdsData[i];
+
+      float value2 = tdsData[i + 1];
+
+
+      float normalized1 = (value1 - graphMin) / graphRange;
+
+      float normalized2 = (value2 - graphMin) / graphRange;
+
+      int x1 = graphX + ((float)i / (GRAPH_POINTS - 1)) * graphWidth;
+
+      int x2 = graphX + ((float)(i + 1) / (GRAPH_POINTS - 1)) * graphWidth;
+
+
+
+      int y1 = graphY + graphHeight - (normalized1 * graphHeight);
+
+      int y2 = graphY + graphHeight - (normalized2 * graphHeight);
+
+
+      tft.drawLine(x1, y1, x2, y2, ACCENT_COLOR);
+
+
+      tft.fillCircle(x1, y1, 2, ACCENT_COLOR);
+
+
+      if (i == GRAPH_POINTS - 2) {
+
+        tft.fillCircle(x2, y2, 2, ACCENT_COLOR);
+      }
+    }
+
+    float averageNormalized = (average - graphMin) / graphRange;
+
+    int averageY = graphY + graphHeight - (averageNormalized * graphHeight);
+
+
+    for (int x = graphX; x < graphX + graphWidth; x += 8) {
+
+      tft.drawFastHLine(x, averageY, 4, ACCENT_COLOR);
+    }
+
+    tft.setTextDatum(TL_DATUM);
+  }
+
+  else if (selectedGraph == 4) {
+
+    tft.resetViewport();
+    tft.fillScreen(BACKGROUND_COLOR);
+
+    drawHeader("FRESH TEMP DATA");
+    drawFooter();
+
+    int graphX = 42;
+    int graphY = headerHeight + 10;
+
+    int graphWidth = screenWidth - graphX - 10;
+
+    int graphHeight = screenHeight - headerHeight - footerHeight - 20;
+
+
+    float sum = 0.0;
+
+    for (int i = 0; i < GRAPH_POINTS; i++) {
+      sum += freshReservoirData[i];
+    }
+
+    float average = sum / (float)GRAPH_POINTS;
+
+
+    int centerValue = round(average);
+
+    float graphMin = centerValue - 1.0;
+
+    float graphMax = centerValue + 1.0;
+
+    float graphRange = graphMax - graphMin;
+
+    tft.drawRect(graphX, graphY, graphWidth, graphHeight, BORDER_COLOR);
+
+
+    tft.setTextDatum(MR_DATUM);
+
+    tft.setTextColor(MUTED_COLOR, BACKGROUND_COLOR);
+
+    for (int i = 0; i <= 10; i++) {
+
+      float value = graphMin + (i * 0.2);
+
+      float normalized = (value - graphMin) / graphRange;
+
+      int lineY = graphY + graphHeight - (normalized * graphHeight);
+
+      tft.drawFastHLine(graphX, lineY, graphWidth, 0x2945);
+
+      tft.drawFloat(value, 1, graphX - 4, lineY, 1);
+    }
+
+    for (int i = 0; i < GRAPH_POINTS; i++) {
+
+      int pointX = graphX + ((float)i / (GRAPH_POINTS - 1)) * graphWidth;
+
+      tft.drawFastVLine(pointX, graphY, graphHeight, 0x2945);
+    }
+
+
+    for (int i = 0; i < GRAPH_POINTS - 1; i++) {
+
+      float value1 = freshReservoirData[i];
+
+      float value2 = freshReservoirData[i + 1];
+
+      float normalized1 = (value1 - graphMin) / graphRange;
+
+      float normalized2 = (value2 - graphMin) / graphRange;
+
+      int x1 = graphX + ((float)i / (GRAPH_POINTS - 1)) * graphWidth;
+
+      int x2 = graphX + ((float)(i + 1) / (GRAPH_POINTS - 1)) * graphWidth;
+
+      int y1 = graphY + graphHeight - (normalized1 * graphHeight);
+
+      int y2 = graphY + graphHeight - (normalized2 * graphHeight);
+
+      tft.drawLine(x1, y1, x2, y2, ACCENT_COLOR);
+
+      tft.fillCircle(x1, y1, 2, ACCENT_COLOR);
+
+
+      if (i == GRAPH_POINTS - 2) {
+
+        tft.fillCircle(x2, y2, 2, ACCENT_COLOR);
+      }
+    }
+
+    float averageNormalized = (average - graphMin) / graphRange;
+
+    int averageY = graphY + graphHeight - (averageNormalized * graphHeight);
+
+
+    for (int x = graphX; x < graphX + graphWidth; x += 8) {
+
+      tft.drawFastHLine(x, averageY, 4, ACCENT_COLOR);
+    }
+
+    tft.setTextDatum(TL_DATUM);
+  }
+}
+void handleTouch() {
+  uint16_t x;
+  uint16_t y;
+
+  bool fingerIsDown = tft.getTouch(&x, &y);
+
+  if (fingerIsDown) {
+    if (!fingerWasDown) {
+      fingerWasDown = true;
+      fingerMoved = false;
+
+      touchStartX = x;
+      touchStartY = y;
+
+      lastTouchX = x;
+      lastTouchY = y;
+    } else {
+      bool startedInsideScrollableArea = touchStartY >= headerHeight && touchStartY < screenHeight - footerHeight;
+
+      
+
+      if (startedInsideScrollableArea && currentPage == sensorsPage) {
+        int movement = lastTouchY - y;
+
+        if (abs(movement) >= SCROLL_THRESHOLD) {
+          fingerMoved = true;
+
+          scrollOffset += movement;
+
+          scrollOffset = constrain(scrollOffset, 0, maximumScroll);
+
+          lastTouchY = y;
+
+          drawScrollableArea();
+        }
+      }
+
+     
+
+      else if (startedInsideScrollableArea && currentPage == devicePage) {
+        /*for(int x=0;x<functionCount;x++){
+        if (receivedData.statusArr[x]!=systemInfo.statusArr[x]){
+        systemInfo.statusArr[x]=receivedData.statusArr[x];
+       drawScrollableArea();*/
+
+
+        int movement = lastTouchY - y;
+
+        if (abs(movement) >= SCROLL_THRESHOLD) {
+          fingerMoved = true;
+
+          functionScrollOffset += movement;
+
+          functionScrollOffset = constrain(functionScrollOffset, 0, functionMaximumScroll);
+
+          lastTouchY = y;
+
+          drawFunctionScrollableArea();
+        }
+      } else if (startedInsideScrollableArea && currentPage == mainGraphPage) {
+        /*for(int x=0;x<functionCount;x++){
+        if (receivedData.statusArr[x]!=systemInfo.statusArr[x]){
+        systemInfo.statusArr[x]=receivedData.statusArr[x];
+       drawScrollableArea();*/
+
+
+        int movement = lastTouchY - y;
+
+        if (abs(movement) >= SCROLL_THRESHOLD) {
+          fingerMoved = true;
+
+          graphScrollOffset += movement;
+
+          graphScrollOffset = constrain(graphScrollOffset, 0, graphMaximumScroll);
+
+          lastTouchY = y;
+
+          drawMainGraphScrollableArea();
+        }
+      } else if (startedInsideScrollableArea && currentPage == waterChangePage) {
+        /*for(int x=0;x<functionCount;x++){
+        if (receivedData.statusArr[x]!=systemInfo.statusArr[x]){
+        systemInfo.statusArr[x]=receivedData.statusArr[x];
+       drawScrollableArea();*/
+
+
+        int movement = lastTouchY - y;
+
+        if (abs(movement) >= SCROLL_THRESHOLD) {
+          fingerMoved = true;
+
+          waterChangeScrollOffset += movement;
+
+          waterChangeScrollOffset = constrain(waterChangeScrollOffset, 0, waterChangeMaximumScroll);
+
+          lastTouchY = y;
+
+          drawWaterChangeScrollableArea();
+        }
+      }
+      /*else if(startedInsideScrollableArea &&currentPage == mainFunctionPage){
+        drawMainFunctionPage();
+      }
+      */
+    }
+  }
+
+  
+  else if (fingerWasDown) {
+    fingerWasDown = false;
+
+    if (fingerMoved) {
+     
+      scrollStoppedTime = millis();
+    } else {
+      
+      if (millis() - scrollStoppedTime >= TOUCH_WAIT_AFTER_SCROLL) {
+        handleTap(touchStartX, touchStartY);
+      }
+    }
+  }
+}
+
+
+
+void handleTap(uint16_t x, uint16_t y) {
+  // Footer navigation
+  if (y >= screenHeight - footerHeight) {
+    checkFooterTouch(x);
+    return;
+  }
+
+  if (currentPage == homePage) {
+    checkHomeTouch(x, y);
+  }
+
+  else if (currentPage == mainFunctionPage) {
+    //checkFunctionTouch(x, y);
+    checkMainFunctionPageTouch(x, y);
+  } else if (currentPage == devicePage) {
+    checkFunctionTouch(x, y);
+  } else if (currentPage == mainGraphPage) {
+    checkMainGraphPageTouch(x, y);
+  } else if (currentPage == waterChangePage) {
+    checkWaterChangePageTouch(x, y);
+  } else if (currentPage == waterChangePopUp) {
+    checkWaterChangePopUpTouch(x, y);
+  } else if (currentPage == fillPopUp) {
+    checkFillPopUpTouch(x, y);
+  } else if (currentPage == drainPopUp) {
+    checkDrainPopUpTouch(x, y);
+  } else if (currentPage == transferPopUp) {
+    checkTransferPopUpTouch(x, y);
+  } else if (currentPage == reservoirFillpopUp) {
+    checkReservoirFillPopUpTouch(x, y);
+  }
+}
+
+void checkFooterTouch(uint16_t x) {
+  int sectionWidth = screenWidth / 4;
+
+  int selectedSection = x / sectionWidth;
+
+  if (selectedSection == 0) {
+    currentPage = homePage;
+  } else if (selectedSection == 1) {
+    currentPage = sensorsPage;
+  } else if (selectedSection == 2) {
+    currentPage = mainFunctionPage;
+  } else if (selectedSection == 3) {
+    currentPage = mainGraphPage;
+  }
+
+  drawCurrentPage();
+}
+
+void checkHomeTouch(uint16_t x, uint16_t y) {
+  int availableHeight = screenHeight - headerHeight - footerHeight;
+
+  int buttonGap = 8;
+  int outerMargin = 10;
+
+  int buttonWidth = (screenWidth - outerMargin * 2 - buttonGap * 2) / 3;
+
+  int buttonHeight = 90;
+
+  int buttonY = headerHeight + (availableHeight - buttonHeight) / 2;
+
+  int sensorX = outerMargin;
+
+  int functionX = outerMargin + buttonWidth + buttonGap;
+
+  int dataX = outerMargin + (buttonWidth + buttonGap) * 2;
+
+  if (pointInside(x, y, sensorX, buttonY, buttonWidth, buttonHeight)) {
+    currentPage = sensorsPage;
+    drawCurrentPage();
+  }
+
+  else if (pointInside(x, y, functionX, buttonY, buttonWidth, buttonHeight)) {
+    currentPage = mainFunctionPage;
+    //currentPage = devicePage;
+    drawCurrentPage();
+  }
+
+  else if (pointInside(x, y, dataX, buttonY, buttonWidth, buttonHeight)) {
+    currentPage = mainGraphPage;
+    drawCurrentPage();
+  }
+}
+
+
+void checkFunctionTouch(uint16_t x, uint16_t y) {
+  int listTop = headerHeight;
+
+  int listBottom = screenHeight - footerHeight;
+
+  if (y < listTop || y >= listBottom) {
+    return;
+  }
+  int toggleLeft = screenWidth - 70;
+  int toggleRight = screenWidth - 10;
+
+  if (x < toggleLeft || x > toggleRight) {
+    return;
+  }
+
+
+  int contentY = y - listTop + functionScrollOffset;
+
+  int rowSpace = FUNCTION_rowHeight + FUNCTION_rowGap;
+
+  int selectedFunction = contentY / rowSpace;
+
+  int positionInsideRow = contentY % rowSpace;
+
+  if (selectedFunction < 0 || selectedFunction >= functionCount || positionInsideRow >= FUNCTION_rowHeight) {
+    return;
+  }
+  for (int x = 0; x < 8; x++) {
+    temporaryStatusArr[x] = systemInfo.statusArr[x];
+  }
+
+  systemInfo.statusArr[selectedFunction] = 2;
+  sendCommandArray(selectedFunction);
+  //sendData();
+
+  Serial.print("Selected function: ");
+  Serial.println(systemInfo.functionNames[selectedFunction]);
+
+  Serial.print("New state: ");
+
+  if (systemInfo.statusArr[selectedFunction] == 1) {
+    Serial.println("ON");
+  } else {
+    Serial.println("OFF");
+  }
+
+
+
+  drawFunctionScrollableArea();
+}
+
+
+bool pointInside(int touchX, int touchY, int rectangleX, int rectangleY, int rectangleWidth, int rectangleHeight) {
+  return (touchX >= rectangleX && touchX <= rectangleX + rectangleWidth && touchY >= rectangleY && touchY <= rectangleY + rectangleHeight);
+}
+void drawCurrentPage() {
+  tft.resetViewport();
+  tft.fillScreen(BACKGROUND_COLOR);
+
+  if (currentPage == homePage) {
+    drawHomePage();
+  } else if (currentPage == sensorsPage) {
+    drawSensorsPage();
+  } else if (currentPage == mainFunctionPage) {
+    drawMainFunctionPage();
+
+  } else if (currentPage == devicePage) {
+    drawFunctionsPage();
+  }
+  //else if (currentPage == graphPage) {
+  // drawGraphPage();
+  // }
+  else if (currentPage == mainGraphPage) {
+    drawMainGraphPage();
+  } else if (currentPage == waterChangePage) {
+    drawWaterChangePage();
+  }
+}
+void setup() {
+  Serial.begin(115200);
+  tft.init();
+  tft.setRotation(1);
+  tft.setTouch(calibrationData);
+  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+  while (wifiMulti.run() != WL_CONNECTED) {
+    delay(100);
+  }
+
+  Serial.println("Connected");
+  
+  wsClient.beginSSL(WS_HOST, WS_PORT, WS_URL);
+  wsClient.onEvent(onWSEvent);
+  wsClient.setReconnectInterval(5000);
+  wsClient.enableHeartbeat(15000, 3000, 2);
+
+  sensors.begin();
+
+  espLinkUDP.begin(FRONT_RX_PORT);
+  Serial.print("Front ESP UDP listening on port ");
+  Serial.println(FRONT_RX_PORT);
+  pinMode(BACKLIGHT_PIN, OUTPUT);
+  pinMode(floatSwitchFresh, INPUT_PULLUP);
+  pinMode(floatSwitchSalt, INPUT_PULLUP);
+  pinMode(tdsMeter, INPUT);
+  analogSetPinAttenuation(tdsMeter, ADC_11db);
+  pinMode(flowPinIn, INPUT_PULLUP);
+  pinMode(flowPinOut, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(flowPinIn), flowMeterIn, FALLING);
+  attachInterrupt(digitalPinToInterrupt(flowPinOut), flowMeterOut, FALLING);
+
+
+
+  digitalWrite(BACKLIGHT_PIN, HIGH);  // USB Serial Monitor
+
+
+  screenWidth = tft.width();
+  screenHeight = tft.height();
+
+  calculateMaximumScroll();
+  calculateFunctionMaximumScroll();
+  calculateWaterChangeMaximumScroll();
+  calculateGraphMaximumScroll();
+
+  drawCurrentPage();
+
+  
+}
+
+void sleepScreen() {
+  if (screenSleeping) {
+    return;
+  }
+
+  digitalWrite(BACKLIGHT_PIN, LOW);
+  screenSleeping = true;
+}
+void wakeScreen() {
+  if (!screenSleeping) {
+    return;
+  }
+
+  digitalWrite(BACKLIGHT_PIN, HIGH);
+  delay(20);
+
+  drawCurrentPage();  // Draw the image again
+
+  screenSleeping = false;
+  lastTouchTime = millis();
+}
+void checkTouch() {
+  uint16_t x, y;
+
+  bool touched = tft.getTouch(&x, &y);
+
+  if (touched) {
+    if (screenSleeping) {
+      wakeScreen();
+      delay(200);
+      return;
+    }
+
+    lastTouchTime = millis();
+
+    
+  }
+}
+void getGraphData() {
+  if (!(dataIndex == 12)) {
+    tankTempData[dataIndex] = systemInfo.parameters[0];
+    saltReservoirTempData[dataIndex] = systemInfo.parameters[1];
+    phData[dataIndex] = systemInfo.parameters[2];
+    tdsData[dataIndex] = systemInfo.parameters[5];
+    freshReservoirData[dataIndex] = systemInfo.parameters[6];
+    dataIndex++;
+  } else {
+    dataIndex = 0;
+    for (int y = 0; y < 12; y++) {
+      tankTempData[y] = 0;
+      saltReservoirTempData[y] = 0;
+      phData[y] = 0;
+      tdsData[y] = 0;
+      freshReservoirData[y] = 0;
+    }
+  }
+}
+void getData() {
+  int packetSize = espLinkUDP.parsePacket();
+  if (packetSize <= 0) {
+    return;
+  }
+
+ 
+  if (packetSize != sizeof(dataRecieved)) {
+    Serial.print("WiFi packet rejected: received ");
+    Serial.print(packetSize);
+    Serial.print(", expected ");
+    Serial.println(sizeof(dataRecieved));
+
+  
+    while (espLinkUDP.available()) {
+      espLinkUDP.read();
+    }
+    return;
+  }
+
+  dataRecieved temporary = {};
+  int count = espLinkUDP.read(reinterpret_cast<uint8_t*>(&temporary), sizeof(temporary));
+  if (count != sizeof(temporary)) {
+    Serial.println("WiFi status packet incomplete");
+    return;
+  }
+
+  bool valid = true;
+
+  if (temporary.header != PACKET_HEADER) {
+    valid = false;
+  }
+
+  if (temporary.footer != PACKET_FOOTER) {
+    Serial.print("invalid footer: 0x");
+    Serial.println(temporary.footer, HEX);
+    valid = false;
+  }
+
+  if (temporary.changeStatus < 0 || temporary.changeStatus > 6) {
+    valid = false;
+  }
+
+  for (int i = 0; i < waterChangeFunctions; i++) {
+    if (temporary.waterChangeStatusArr[i] != 0 && temporary.waterChangeStatusArr[i] != 1) {
+      valid = false;
+    }
+  }
+
+  for (int i = 0; i < functionCount; i++) {
+    if (temporary.statusArr[i] != 0 && temporary.statusArr[i] != 1) {
+      valid = false;
+    }
+  }
+
+  if (!valid) {
+    Serial.println("WiFi status packet rejected");
+    return;
+  }
+
+  receivedData = temporary;
+  systemInfo.changeStatus = temporary.changeStatus;
+
+  bool waterChangeStatusChanged = false;
+  for (int a = 0; a < waterChangeFunctions; a++) {
+    if (systemInfo.waterChangeStatusArr[a] != temporary.waterChangeStatusArr[a]) {
+      systemInfo.waterChangeStatusArr[a] = temporary.waterChangeStatusArr[a];
+      waterChangeStatusChanged = true;
+    }
+  }
+
+  if (waterChangeStatusChanged && currentPage == waterChangePage) {
+    drawWaterChangeScrollableArea();
+  }
+
+  displayStatus();
+
+  bool statusChanged = false;
+  for (int y = 0; y < functionCount; y++) {
+    if (systemInfo.statusArr[y] != temporary.statusArr[y]) {
+      systemInfo.statusArr[y] = temporary.statusArr[y];
+      temporaryStatusArr[y] = temporary.statusArr[y];
+      statusChanged = true;
+    }
+  }
+
+  if (statusChanged && currentPage == devicePage) {
+    drawFunctionScrollableArea();
+  }
+}
+void getFlowData() {
+  if (millis() - flowIntervalFill >= 1000) {
+    noInterrupts();
+    fillPulses = pulseCount1;
+    pulseCount1 = 0;
+    interrupts();
+
+    flowIntervalFill = millis();
+
+    if (countFillFlow) {
+      gallonsIn += (fillPulses / 7.5 / 60.0) * 0.264172;
+    }
+    systemInfo.fillGallons = gallonsIn;
+
+    Serial.print("fill gallons: ");
+    Serial.println(gallonsIn, 4);
+  }
+  if (millis() - flowIntervalDrain >= 1000) {
+    noInterrupts();
+    drainPulses = pulseCount2;
+    pulseCount2 = 0;
+    interrupts();
+
+    flowIntervalDrain = millis();
+
+    if (countDrainFlow) {
+      gallonsOut += (drainPulses / 7.5 / 60.0) * 0.264172;
+    }
+    systemInfo.drainGallons = gallonsOut;
+
+    Serial.print("Drain gallons: ");
+    Serial.println(gallonsOut, 4);
+  }
+}
+void loop() {
+  getData();
+  getFlowData();
+
+  wsClient.loop();
+  handleTouch();
+  if ((ph = readPh()) > 0) {
+    systemInfo.parameters[2] = ph;
+  }
+  float tds = readTds();
+  if (tds > 0) {
+    systemInfo.parameters[5] = tds;
+  }
+  if (millis() - dataInterval > 1000) {
+    dataInterval = millis();
+
+    //systemInfo.tankTemp=getTemp();
+    //systemInfo.tankPh=readPh();
+    getParameters();
+    sendData();
+    if (currentPage == sensorsPage) {
+      drawScrollableArea();
+    }
+    sendSensorData();
+    checkWiFiStatus();
+    if (inFill || inDrain || reservoirFillingInProgress || inTransfer) {
+      drawHeaderWithPage();
+    }
+  }
+  if (millis() - graphDataInterval > 3600000) {
+    graphDataInterval = millis();
+    getGraphData();
+  }
+  checkTouch();
+
+  checkScreenTimer();
+  if (inFill || inDrain || reservoirFillingInProgress || inTransfer) {
+  }
+}
